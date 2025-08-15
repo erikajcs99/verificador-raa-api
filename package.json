@@ -4,8 +4,7 @@
   "description": "API HTTP para verificar códigos RAA con Playwright",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "npx playwright install chromium"
+    "start": "node server.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
