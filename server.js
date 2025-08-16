@@ -1,4 +1,3 @@
-// server.js
 const express = require("express");
 const cors = require("cors");
 const { chromium } = require("playwright");
@@ -7,11 +6,11 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(cors({ origin: "*" }));
 
-// ---------- Health ----------
+// ---------------- Health ----------------
 app.get("/", (_, res) => res.status(200).send("OK"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// ---------- Navegador compartido (más rápido) ----------
+// ---------------- Lanzar navegador 1 sola vez ----------------
 let browserPromise = null;
 async function getBrowser() {
   if (!browserPromise) {
@@ -22,11 +21,15 @@ async function getBrowser() {
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
+        "--no-zygote",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-features=VizDisplayCompositor",
       ],
-    }).then(b => {
+    }).then((b) => {
       console.log("[boot] Chromium listo");
       return b;
-    }).catch(err => {
+    }).catch((err) => {
       console.error("[boot] fallo al lanzar Chromium:", err);
       browserPromise = null;
       throw err;
@@ -35,28 +38,47 @@ async function getBrowser() {
   return browserPromise;
 }
 
-// ---------- Endpoints de debug ----------
-app.get("/debug/launch", async (_, res) => {
+// ---------------- Endpoints de debug ----------------
+app.get("/debug/launch", async (_req, res) => {
   try {
     const browser = await getBrowser();
-    const context = await browser.newContext();
-    const page = await context.newPage();
+    const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
+    const page = await ctx.newPage();
     await page.close();
-    await context.close();
-    res.json({ ok: true, stage: "launch-only" });
+    await ctx.close();
+    res.json({ ok: true, stage: "launch" });
   } catch (e) {
     console.error("[debug/launch]", e);
-    res.status(500).json({ ok: false, stage: "launch-only", error: String(e) });
+    res.status(500).json({ ok: false, stage: "launch", error: String(e) });
   }
 });
 
-app.get("/debug/example", async (_, res) => {
+// red sin chromium (node fetch)
+app.get("/debug/node-fetch", async (_req, res) => {
+  try {
+    const r = await fetch("https://example.com", { redirect: "follow" });
+    const text = await r.text();
+    res.json({ ok: true, status: r.status, bytes: text.length });
+  } catch (e) {
+    console.error("[debug/node-fetch]", e);
+    res.status(500).json({ ok: false, stage: "node-fetch", error: String(e) });
+  }
+});
+
+app.get("/debug/example", async (_req, res) => {
   try {
     const browser = await getBrowser();
-    const ctx = await browser.newContext();
+    const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
     const page = await ctx.newPage();
-    await page.goto("https://example.com", { waitUntil: "domcontentloaded", timeout: 60000 });
-    const title = await page.title();
+
+    // intenta https, si falla reintenta http
+    try {
+      await page.goto("https://example.com", { waitUntil: "domcontentloaded", timeout: 60000 });
+    } catch {
+      await page.goto("http://example.com", { waitUntil: "domcontentloaded", timeout: 60000 });
+    }
+
+    const title = await page.title().catch(() => null);
     await ctx.close();
     res.json({ ok: true, stage: "goto-example", title });
   } catch (e) {
@@ -65,10 +87,10 @@ app.get("/debug/example", async (_, res) => {
   }
 });
 
-app.get("/debug/raa-title", async (_, res) => {
+app.get("/debug/raa-title", async (_req, res) => {
   try {
     const browser = await getBrowser();
-    const ctx = await browser.newContext({ userAgent: "Mozilla/5.0" });
+    const ctx = await browser.newContext({ userAgent: "Mozilla/5.0", ignoreHTTPSErrors: true });
     const page = await ctx.newPage();
     await page.goto("https://www.raa.org.co/", { waitUntil: "domcontentloaded", timeout: 90000 });
     const title = await page.title().catch(() => null);
@@ -80,7 +102,7 @@ app.get("/debug/raa-title", async (_, res) => {
   }
 });
 
-// ---------- Helpers de scraping ----------
+// ---------------- Helpers RAA ----------------
 async function closeMaintenancePopup(page) {
   const start = Date.now();
   const maxMs = 6000;
@@ -133,7 +155,6 @@ function parse(items) {
   return { valid, active, nombre, era, estado, fechaRegistro, fechaAprobacion: fechaAprob, codigo };
 }
 
-// ---------- Cache simple ----------
 const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 const cache = new Map();
 const hit = (code) => {
@@ -142,7 +163,7 @@ const hit = (code) => {
 };
 const put = (code, data) => cache.set(code, { at: Date.now(), data });
 
-// ---------- Endpoint principal ----------
+// ---------------- Endpoint principal ----------------
 app.post("/verify", async (req, res) => {
   let raw = String(req.body?.code || "").trim().toUpperCase();
   raw = raw.replace(/[\u2010-\u2015\u2212]/g, "-").replace(/[^A-Z0-9-]/g, "");
@@ -157,7 +178,7 @@ app.post("/verify", async (req, res) => {
   try {
     console.log("[verify] start", raw);
     const browser = await getBrowser();
-    ctx = await browser.newContext({ userAgent: "Mozilla/5.0" });
+    ctx = await browser.newContext({ userAgent: "Mozilla/5.0", ignoreHTTPSErrors: true });
     page = await ctx.newPage();
 
     console.log("[verify] goto raa");
@@ -193,10 +214,10 @@ app.post("/verify", async (req, res) => {
   }
 });
 
-// ---------- Server ----------
+// ---------------- Server ----------------
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`API de RAA escuchando en :${PORT}`);
 });
-server.requestTimeout = 180000; // 180s
+server.requestTimeout = 180000;
 server.headersTimeout = 180000;
