@@ -7,24 +7,84 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(cors({ origin: "*" }));
 
-// --- healthchecks para Render/tu prueba ---
+// ---------- Health ----------
 app.get("/", (_, res) => res.status(200).send("OK"));
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-// cache simple (12h)
-const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-const cache = new Map();
-const hit = (code) => {
-  const v = cache.get(code);
-  return v && Date.now() - v.at < CACHE_TTL_MS ? v.data : null;
-};
-const put = (code, data) => cache.set(code, { at: Date.now(), data });
+// ---------- Navegador compartido (más rápido) ----------
+let browserPromise = null;
+async function getBrowser() {
+  if (!browserPromise) {
+    console.log("[boot] lanzando Chromium…");
+    browserPromise = chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+      ],
+    }).then(b => {
+      console.log("[boot] Chromium listo");
+      return b;
+    }).catch(err => {
+      console.error("[boot] fallo al lanzar Chromium:", err);
+      browserPromise = null;
+      throw err;
+    });
+  }
+  return browserPromise;
+}
 
-// cierra modal mantenimiento (igual que local)
+// ---------- Endpoints de debug ----------
+app.get("/debug/launch", async (_, res) => {
+  try {
+    const browser = await getBrowser();
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.close();
+    await context.close();
+    res.json({ ok: true, stage: "launch-only" });
+  } catch (e) {
+    console.error("[debug/launch]", e);
+    res.status(500).json({ ok: false, stage: "launch-only", error: String(e) });
+  }
+});
+
+app.get("/debug/example", async (_, res) => {
+  try {
+    const browser = await getBrowser();
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    await page.goto("https://example.com", { waitUntil: "domcontentloaded", timeout: 60000 });
+    const title = await page.title();
+    await ctx.close();
+    res.json({ ok: true, stage: "goto-example", title });
+  } catch (e) {
+    console.error("[debug/example]", e);
+    res.status(500).json({ ok: false, stage: "goto-example", error: String(e) });
+  }
+});
+
+app.get("/debug/raa-title", async (_, res) => {
+  try {
+    const browser = await getBrowser();
+    const ctx = await browser.newContext({ userAgent: "Mozilla/5.0" });
+    const page = await ctx.newPage();
+    await page.goto("https://www.raa.org.co/", { waitUntil: "domcontentloaded", timeout: 90000 });
+    const title = await page.title().catch(() => null);
+    await ctx.close();
+    res.json({ ok: true, stage: "goto-raa", title });
+  } catch (e) {
+    console.error("[debug/raa-title]", e);
+    res.status(500).json({ ok: false, stage: "goto-raa", error: String(e) });
+  }
+});
+
+// ---------- Helpers de scraping ----------
 async function closeMaintenancePopup(page) {
   const start = Date.now();
   const maxMs = 6000;
-  const selectors = [
+  const sels = [
     ".ui-dialog .ui-dialog-titlebar .ui-dialog-titlebar-close",
     ".ui-dialog-titlebar-close",
     'button[aria-label="Close"]',
@@ -33,7 +93,7 @@ async function closeMaintenancePopup(page) {
     'button:has-text("Cerrar")',
   ];
   while (Date.now() - start < maxMs) {
-    for (const sel of selectors) {
+    for (const sel of sels) {
       try {
         const loc = page.locator(sel).first();
         if (await loc.isVisible({ timeout: 150 })) {
@@ -43,11 +103,9 @@ async function closeMaintenancePopup(page) {
         }
       } catch {}
     }
-    try {
-      await page.keyboard.press("Escape");
-      await page.waitForTimeout(150);
-      if (!(await page.locator(".ui-dialog:visible").count())) return;
-    } catch {}
+    try { await page.keyboard.press("Escape"); } catch {}
+    await page.waitForTimeout(150);
+    if (!(await page.locator(".ui-dialog:visible").count())) return;
     try {
       const overlay = page.locator(".ui-widget-overlay, .ui-front.ui-widget-overlay").first();
       if (await overlay.isVisible({ timeout: 150 })) {
@@ -56,7 +114,6 @@ async function closeMaintenancePopup(page) {
         if (!(await page.locator(".ui-dialog:visible").count())) return;
       }
     } catch {}
-    await page.waitForTimeout(150);
   }
 }
 
@@ -76,6 +133,16 @@ function parse(items) {
   return { valid, active, nombre, era, estado, fechaRegistro, fechaAprobacion: fechaAprob, codigo };
 }
 
+// ---------- Cache simple ----------
+const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const cache = new Map();
+const hit = (code) => {
+  const v = cache.get(code);
+  return v && Date.now() - v.at < CACHE_TTL_MS ? v.data : null;
+};
+const put = (code, data) => cache.set(code, { at: Date.now(), data });
+
+// ---------- Endpoint principal ----------
 app.post("/verify", async (req, res) => {
   let raw = String(req.body?.code || "").trim().toUpperCase();
   raw = raw.replace(/[\u2010-\u2015\u2212]/g, "-").replace(/[^A-Z0-9-]/g, "");
@@ -83,51 +150,53 @@ app.post("/verify", async (req, res) => {
     return res.status(400).json({ valid: false, active: false, reason: "pattern", code: raw });
   }
 
-  // cache
   const cached = hit(raw);
   if (cached) return res.json({ cached: true, code: raw, ...cached });
 
-  let browser;
+  let ctx, page;
   try {
-    // ⚠️ flags recomendados para contenedores (evitan 502 por crash/timeout)
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage", // evita /dev/shm pequeño en contenedores
-      ],
-    });
+    console.log("[verify] start", raw);
+    const browser = await getBrowser();
+    ctx = await browser.newContext({ userAgent: "Mozilla/5.0" });
+    page = await ctx.newPage();
 
-    const page = await browser.newPage({ userAgent: "Mozilla/5.0" });
+    console.log("[verify] goto raa");
     await page.goto("https://www.raa.org.co/", { waitUntil: "domcontentloaded", timeout: 90000 });
 
+    console.log("[verify] close modal if any");
     await closeMaintenancePopup(page);
 
+    console.log("[verify] fill code");
     const input = page.locator('input[type="text"], #edit-code').first();
     await input.waitFor({ timeout: 20000 });
     await input.fill(raw);
 
+    console.log("[verify] click submit");
     const btn = page.locator('input[type="submit"][value="Revisar"], #edit-submit, input[value="VALIDAR"]').first();
     await btn.click({ timeout: 20000 });
 
+    console.log("[verify] wait results");
     await page.waitForSelector("div.top-item", { timeout: 90000 });
+
     const items = await page.$$eval("div.top-item", nodes => nodes.map(n => n.textContent.trim()));
     const parsed = parse(items);
+    console.log("[verify] parsed", parsed);
 
     put(raw, parsed);
-    return res.json({ cached: false, code: raw, ...parsed });
-  } catch (err) {
-    console.error("verify error:", err);
-    return res.status(502).json({ ok: false, error: "upstream_or_browser", message: String(err) });
+    res.json({ cached: false, code: raw, ...parsed });
+  } catch (e) {
+    console.error("[verify] error", e);
+    res.status(502).json({ ok: false, stage: "verify", message: String(e) });
   } finally {
-    if (browser) await browser.close();
+    try { if (page) await page.close(); } catch {}
+    try { if (ctx) await ctx.close(); } catch {}
   }
 });
 
+// ---------- Server ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("////////////////////////////////////////");
+const server = app.listen(PORT, () => {
   console.log(`API de RAA escuchando en :${PORT}`);
-  console.log("////////////////////////////////////////");
 });
+server.requestTimeout = 180000; // 180s
+server.headersTimeout = 180000;
