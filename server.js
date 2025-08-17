@@ -230,7 +230,7 @@ app.post("/verify", async (req, res) => {
     .replace(/[^A-Z0-9-]/g, ""); // quita otros símbolos
 
   // valida patrón
-  if (!/^AVAL-\d{9,11}$/.test(raw)) {
+  if (!/^AVAL-\d{1,20}$/.test(raw)) {
     return res
       .status(400)
       .json({ valid: false, active: false, reason: "pattern", code: raw });
